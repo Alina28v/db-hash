@@ -1,0 +1,184 @@
+import dotenv from 'dotenv';
+dotenv.config();
+
+import pg from 'pg';
+const { Pool } = pg;
+import { hashSync, compareSync } from 'bcrypt';
+import { existsSync, readFileSync, writeFileSync } from 'fs';
+
+// Перевірка наявності URL бази даних
+if (!process.env.DB_URL) {
+    console.error('❌ Помилка: DB_URL не знайдено в .env файлі');
+    process.exit(1);
+}
+
+const pool = new Pool({
+    connectionString: process.env.DB_URL,
+    ssl: { rejectUnauthorized: false } // Додано для сумісності з багатьма хмарними БД
+});
+
+const SALT_ROUNDS = 10;
+const PASSWORD_FILE = 'password.txt';
+
+/**
+ * Перевірка пароля
+ */
+function verifyPassword(password) {
+    if (!password) {
+        console.error('⚠️  Доступ заборонено: потрібен пароль. Використовуйте --password <пароль>');
+        return false;
+    }
+
+    if (!existsSync(PASSWORD_FILE)) {
+        const hash = hashSync(password, SALT_ROUNDS);
+        writeFileSync(PASSWORD_FILE, hash);
+        console.log('🔐 Пароль встановлено вперше і збережено.');
+        return true;
+    }
+
+    const storedHash = readFileSync(PASSWORD_FILE, 'utf8').trim();
+    const isMatch = compareSync(password, storedHash);
+
+    if (!isMatch) {
+        console.error('❌ Невірний пароль.');
+    }
+    return isMatch;
+}
+
+/**
+ * Витягування пароля з аргументів
+ */
+function extractPassword(argv) {
+    const args = [...argv];
+    const idx = args.indexOf('--password');
+    let password = null;
+
+    if (idx !== -1) {
+        password = args[idx + 1] ?? null;
+        args.splice(idx, 2);
+    }
+
+    return { password, args };
+}
+
+/**
+ * Ініціалізація структури БД
+ */
+const initializeDatabase = async () => {
+    const createTableQuery = `
+    CREATE TABLE IF NOT EXISTS dogs (
+        id SERIAL PRIMARY KEY,
+        name TEXT NOT NULL,
+        breed TEXT NOT NULL,
+        age TEXT,
+        gender TEXT,
+        weight TEXT,
+        color TEXT,
+        owner TEXT,
+        is_available BOOLEAN DEFAULT TRUE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );`;
+    await pool.query(createTableQuery);
+};
+
+/**
+ * Операції з даними
+ */
+async function addDog(data) {
+    if (data.length < 7) {
+        throw new Error('Недостатньо даних! Потрібно: name, breed, age, gender, weight, color, owner');
+    }
+    const query = `
+        INSERT INTO dogs (name, breed, age, gender, weight, color, owner)
+        VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`;
+    const res = await pool.query(query, data);
+    console.log(`✅ Собака ${data[0]} додана з ID: ${res.rows[0].id}`);
+}
+
+async function listDogs() {
+    try {
+        const { rows } = await pool.query('SELECT id, name, breed, age, owner FROM dogs ORDER BY id ASC');
+        if (rows.length === 0) {
+            console.log('📭 База даних порожня.');
+        } else {
+            console.table(rows);
+        }
+    } catch (err) {
+        if (err.code === '42P01') { // Таблиця не існує
+            console.log('⚠️  Таблиця не знайдена. Спробуйте спочатку: node database.js init --password <pw>');
+        } else {
+            throw err;
+        }
+    }
+}
+
+async function run() {
+    const { password, args } = extractPassword(process.argv.slice(2));
+    const command = args[0];
+    const params = args.slice(1);
+
+    if (!command || command === 'help') {
+        console.log(`
+==================================================
+   DOG DATABASE MANAGER v1.2
+==================================================
+Доступні команди:
+  node database.js list                      - Список собак
+  node database.js add --password <pw> ...   - Додати (7 параметрів)
+  node database.js update --password <pw> <id> <field> <value>
+  node database.js delete --password <pw> <id>
+  node database.js init --password <pw>      - Створити таблицю
+==================================================`);
+        await pool.end();
+        return;
+    }
+
+    try {
+        // Команди без пароля
+        if (command === 'list') {
+            await listDogs();
+            return;
+        }
+
+        // Команди з паролем
+        if (!verifyPassword(password)) {
+            process.exitCode = 1;
+            return;
+        }
+
+        switch (command) {
+            case 'init':
+                await pool.query('DROP TABLE IF EXISTS dogs');
+                await initializeDatabase();
+                console.log('✨ База ініціалізована.');
+                break;
+
+            case 'add':
+                await addDog(params);
+                break;
+
+            case 'delete':
+                const delRes = await pool.query('DELETE FROM dogs WHERE id = $1', [params[0]]);
+                console.log(delRes.rowCount > 0 ? '🗑️ Видалено.' : '❓ ID не знайдено.');
+                break;
+
+            case 'update':
+                const [id, col, val] = params;
+                const allowed = ['name', 'breed', 'age', 'gender', 'weight', 'color', 'owner'];
+                if (!allowed.includes(col)) throw new Error('Неприпустима назва колонки.');
+                
+                const updRes = await pool.query(`UPDATE dogs SET ${col} = $1 WHERE id = $2`, [val, id]);
+                console.log(updRes.rowCount > 0 ? '📝 Оновлено.' : '❓ ID не знайдено.');
+                break;
+
+            default:
+                console.log("❌ Невідома команда. Спробуйте 'help'");
+        }
+    } catch (err) {
+        console.error('💥 Помилка виконання:', err.message);
+    } finally {
+        await pool.end();
+    }
+}
+
+run();
